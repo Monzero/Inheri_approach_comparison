@@ -18,6 +18,43 @@ hard to actually quantify without measuring it. This harness measures it:
 same documents, same model, equivalent prompts, only the architecture
 differs.
 
+## Executive Summary
+
+For a workload of **2,500 applications per month**, with **5 documents per
+application** and approximately **700 text tokens per document**, the monthly
+volume is 12,500 documents. Using the measured sample averages and the Gemini
+2.5 Pro rates above ($1.25 per 1M input tokens and $10 per 1M output tokens):
+
+| Metric | Approach A (extract once) | Approach B (reprocess) | Difference |
+|---|---:|---:|---:|
+| Estimated cost per document | $0.011238 | $0.005480 | B saves $0.005758 |
+| Estimated cost per application | **$0.0562** | **$0.0274** | **B saves $0.0288** |
+| Estimated monthly cost | **$140.47** | **$68.50** | **B saves $71.97** |
+| Sequential agent latency per document | **6.84s** | **13.37s** | **A is 6.52s faster** |
+
+At this larger document-text size, Approach B is estimated to cost about 51.2%
+less than Approach A, even though it takes about 95.4% longer per document once
+artifact-store loading is included. The cost reversal happens because Approach
+A must emit the full 700-token transcription, and output tokens cost much more
+than input tokens. Approach A uses fewer input tokens and is faster in the
+measured sequential benchmark; Approach B avoids the large transcription
+output but resends each document to all three agents.
+
+The cost estimate assumes one extraction, one classification, and one schema
+extraction call per document, with the sample's measured output sizes for the
+downstream agents. The latency estimate applies the measured mean per-document
+latencies to one document and adds **3 seconds for every raw-document load from
+the artifact store**. Approach A loads each document once, adding 3 seconds per
+document. Approach B loads each document for all three agents, adding 9 seconds
+per document. The agents are assumed to run sequentially, not in parallel,
+while the five documents within one application can be processed in parallel.
+Therefore, the application wall-clock latency can be approximately the
+per-document latency when all five document jobs run concurrently, although
+total compute and API usage still scale with five documents. This does not
+model any additional latency caused by a 700-token transcription, so a
+production rerun with representative documents should be used for final
+latency planning.
+
 ## Approach A — "Extract once"
 
 ```mermaid
@@ -281,15 +318,15 @@ here, pre-filled with the 2.5 Pro rates above) and pass
 
 ## Takeaway
 
-Approach A (extract once) is cheaper overall and has lower P50/mean latency,
-but the reason is more specific than "B repeats more work": B's *input*
-cost scales with agent count (every agent re-pays for the full document),
-while B's *output* cost is actually much lower than A's, since only A's
-Agent 1 has to transcribe anything — every other agent, in either
-approach, is answering a narrow, bounded question and produces comparably
-small output. Approach B's structural advantage is that agents are fully
-independent — no extraction-quality bottleneck where one bad Agent-1 call
-breaks everyone downstream. Whether that independence is worth the added
-input-token cost and latency (here, roughly +13.5% total cost and +14-38%
-latency depending on the percentile) is a product decision these numbers
-are meant to inform, not settle.
+On the small sample run, Approach A (extract once) was cheaper overall and
+had lower P50/mean latency, but the reason is more specific than "B repeats
+more work": B's *input* cost scales with agent count (every agent re-pays for
+the full document), while B's *output* cost is much lower than A's, since only
+A's Agent 1 has to transcribe anything. With 700-token documents, the higher
+output-token cost reverses the cost result: the projection above makes B
+cheaper, while A remains faster in the measured sequential pattern. Approach
+B's structural advantage is that agents are fully independent — no
+extraction-quality bottleneck where one bad Agent-1 call breaks everyone
+downstream. The right choice depends on document size, output-token pricing,
+latency requirements, and whether that independence is worth the repeated
+multimodal input.
