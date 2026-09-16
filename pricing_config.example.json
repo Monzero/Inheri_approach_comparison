@@ -1,0 +1,6 @@
+{
+  "_comment": "Gemini 2.5 Pro published rates (paid tier, prompts <=200k tokens), per Google's pricing page as of Sep 2026: https://ai.google.dev/gemini-api/docs/pricing. Applied to whatever model you actually ran with, so treat this as an illustrative cost estimate rather than an exact quote unless GEMINI_MODEL is gemini-2.5-pro. cache_storage_cost_per_1m_tokens_per_hour is optional -- omit it (or set it to 0) to skip the 'Est. cache storage (USD)' report row.",
+  "input_cost_per_1m_tokens": 1.25,
+  "output_cost_per_1m_tokens": 10.00,
+  "cache_storage_cost_per_1m_tokens_per_hour": 4.50
+}

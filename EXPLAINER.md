@@ -1,16 +1,18 @@
 # Gemini Document-Processing Architecture Benchmark — Explainer
 
-This document explains what the benchmark harness in this repo does, the two
-architectures it compares, and how to read the results — including a cost
-estimate using published Gemini 3.1 Pro Preview pricing.
+This document explains what the benchmark harness in this repo does, the
+three architectures it compares, and how to read the results — including a
+cost estimate using published Gemini 3.1 Pro Preview pricing.
 
 ## The question being answered
 
-When a pipeline runs several agents over the same document, there are two
+When a pipeline runs several agents over the same document, there are a few
 straightforward ways to give each agent access to the document:
 
 1. **Extract the text once, then pass it to every downstream agent.**
 2. **Give every agent the raw document and let it reprocess it independently.**
+3. **Cache the raw document once, then let every agent query that cache
+   independently.**
 
 These choices can have very different cost profiles as documents get longer or
 more agents are added. The harness measures the difference using the same
@@ -31,6 +33,9 @@ documents, model, and questions, changing only the architecture.
 | Extracted text per document | 700 |
 | Gemini 3.1 Pro Preview input price | $2 / 1M tokens |
 | Gemini 3.1 Pro Preview output price | $12 / 1M tokens |
+| Gemini 3.1 Pro Preview cache-storage price | $4.50 / 1M tokens-hour |
+| Approach C cache lifetime | 1 minute |
+| Approach C cached PDF tokens per document | 1,290 |
 
 ### Approach A — Extract once
 
@@ -56,20 +61,76 @@ documents, model, and questions, changing only the architecture.
 | Monthly output cost | 1.25M x $12 = **$15.00** |
 | **Total monthly cost** | **$111.75** |
 
+### Approach C — Cache once, query many
+
+Approach C's three agents are structurally identical to Approach B's: Agent 1
+returns the same small legibility verdict (not a transcript), and Agents 2/3
+ask the same questions. The only architectural difference is *how* the
+document reaches each agent — through a shared cache instead of three
+independent uploads.
+
+Per the instructions for this projection, the LLM-call cost below
+deliberately assumes **no** input-token discount from caching — see the
+caveat at the end of this section for why. With that assumption, Approach C's
+LLM-call cost is identical to Approach B's; cache storage is added as a
+separate line:
+
+| Calculation | Result |
+|---|---:|
+| Input per document (unchanged from B — no cache discount assumed) | 1,290 PDF x 3 agents = **3,870** |
+| Output per document (unchanged from B) | **100** |
+| Monthly input tokens | 3,870 x 12,500 = **48.375M** |
+| Monthly output tokens | 100 x 12,500 = **1.25M** |
+| Monthly LLM input cost | 48.375M x $2 = **$96.75** |
+| Monthly LLM output cost | 1.25M x $12 = **$15.00** |
+| **Subtotal, LLM calls** | **$111.75** |
+| Cached tokens per document | **1,290** |
+| Cache lifetime | **1 minute** (1/60 hour) |
+| Cached token-hours/month | 1,290 x 12,500 x (1/60) = **268,750** |
+| **Cache storage cost** | 268,750 / 1M x $4.50 = **$1.21** |
+| **Total monthly cost** | **$111.75 + $1.21 = $112.96** |
+
+**Caveat — this deliberately does not assume caching saves money.** The whole
+point of a cache is that Agents 2 and 3 shouldn't need to re-pay for the
+document, but this harness never assumes that: it only reports a discount if
+`cached_content_token_count` in the API's own `usage_metadata` confirms it
+(see `run_approach_c()` and the "Confirmed cache-hit calls" row in the
+benchmark's printed report). Absent that confirmation, this projection treats
+Approach C's LLM-call cost as **identical to Approach B's**, with cache
+storage shown as pure additional overhead — so, on paper, Approach C
+currently looks marginally *more* expensive than B, not less. If a live run
+confirms cache hits, Approach C's real input cost — and therefore its total —
+would drop below what's shown here; that must come from measurement, not this
+spreadsheet.
+
 ### Final comparison
 
-| | Approach A | Approach B | Difference |
+| | Approach A | Approach B | Approach C |
 |---|---:|---:|---:|
-| Input tokens per document | 2,690 | 3,870 | B uses 1,180 more |
-| Output tokens per document | 800 | 100 | A uses 700 more |
-| **Monthly cost** | **$187.25** | **$111.75** | **B saves $75.50** |
-| Sequential latency per document | **6.84s** | **13.37s** | **A is 6.52s faster** |
+| Input tokens per document | 2,690 | 3,870 | 3,870 (no discount assumed) |
+| Output tokens per document | 800 | 100 | 100 |
+| **Monthly LLM cost** | **$187.25** | **$111.75** | **$111.75** |
+| **Monthly cache storage cost** | — | — | **$1.21** |
+| **Total monthly cost** | **$187.25** | **$111.75** | **$112.96** |
+| Sequential latency per document | **6.84s** | **13.37s** | *not modeled — see note* |
 
-The main idea is simple: Approach A saves input tokens by reusing the extracted
-text, but it produces a much larger output. Approach B spends more on input
-tokens, but it avoids the 700-token transcript. These figures use the official
-Gemini 3.1 Pro Preview rates; exact PDF usage should be confirmed with
-`count_tokens()` and response `usage_metadata`.
+The main idea for A vs. B is simple: Approach A saves input tokens by reusing
+the extracted text, but it produces a much larger output. Approach B spends
+more on input tokens, but it avoids the 700-token transcript. These figures
+use the official Gemini 3.1 Pro Preview rates; exact PDF usage should be
+confirmed with `count_tokens()` and response `usage_metadata`.
+
+Approach C's row is left out of the latency line deliberately: the 6.84s/
+13.37s figures in this table predate this document's available history (see
+the removed `goal.txt`) and their derivation — beyond "sum of per-call
+latency" — isn't preserved anywhere in this repo, so extending that specific
+number to C would mean fabricating a comparable figure rather than deriving
+one. What *is* known qualitatively: Approach C's three calls are as
+independent as B's (no shared bottleneck through Agent 1), but each call
+skips re-uploading the raw document, replacing that per-call upload/encoding
+cost with one upfront cache-creation call plus one cache-deletion call. Actual
+latency requires a live run — see `output/cache_metrics_<timestamp>.csv`'s
+`create_seconds` and `delete_seconds` columns.
 
 ### How PDF tokens are counted
 
@@ -135,33 +196,124 @@ flowchart LR
 each agent's output stays small. Input cost grows with the number of agents;
 output cost changes much less.
 
-## What's held constant between A and B, and what's deliberately different
+## Approach C — "Cache once, query many"
+
+```mermaid
+flowchart LR
+    DOC[Original PDF / Image] -->|multimodal input, once| CACHE[(Short-lived\nGemini context cache)]
+    CACHE -->|cached reference| C1["Agent 1\nCheck legibility\n(small output)"]
+    CACHE -->|cached reference| C2[Agent 2\nDocument Classification]
+    CACHE -->|cached reference| C3[Agent 3\nSchema Extraction]
+    C3 -.->|after all agents finish| DEL[Delete cache]
+```
+
+Approach C combines the useful parts of both approaches.
+
+The application loads the PDF once and places the original document into a
+short-lived Gemini cache. All three agents then make their own independent
+LLM calls, but they reference the same cached PDF instead of uploading and
+processing the document again.
+
+```text
+Load PDF once
+    ↓
+Create temporary Gemini cache
+    ↓
+Agent 1: check legibility and document type
+Agent 2: classify the document
+Agent 3: extract required fields
+    ↓
+Delete cache
+```
+
+The key difference is that Agent 1 does **not** create a full text
+transcript. Its response remains small, like Approach B. At the same time,
+Agents 2 and 3 do not need the PDF to be uploaded and processed again because
+they reuse the cached document.
+
+This could give us the best of both approaches:
+
+- Avoid Approach A's large transcription output
+- Avoid Approach B's repeated PDF uploads
+- Keep all three agents independent
+- Reduce repeated document-processing work
+- Potentially reduce input cost and latency
+- Keep the document available only temporarily during processing
+
+However, the three LLM calls still happen. The cache only reuses the document
+context; it does not reuse the agents' answers or eliminate their reasoning.
+The actual benefit must be verified through cache-hit metadata, cached-input
+pricing, cache creation time, cache storage cost, latency, and output
+quality.
+
+### Implementation details
+
+- Agent 1 uses its plain `prompt` in Approach C, never `approach_a_prompt` —
+  the same as Approach B, since nothing downstream needs a transcript. All
+  three agents' calls carry only their own question as `contents`; the
+  document itself is supplied by referencing the cache
+  (`GenerateContentConfig(cached_content=<cache name>)`), not by re-attaching
+  file bytes.
+- The document is loaded from disk exactly once (`load_document()`), then
+  handed to `client.caches.create()` with a 60-second TTL
+  (`CACHE_TTL_SECONDS`). The returned cache name is reused by all three
+  `generate_content` calls.
+- **Cleanup is unconditional.** The three agent calls run inside a
+  `try/finally` in `run_approach_c()`; the cache is deleted in the `finally`
+  block, so it's deleted whether all three agents succeed, one of them raises
+  or returns a failure, or the loop is interrupted partway through. If cache
+  *creation* itself fails, there's nothing to delete, so no delete call is
+  made — that failure mode instead records all three agents as skipped, the
+  same pattern Approach A already uses when its upstream extraction fails.
+- Every call's `cached_content_token_count` is read from the API's own
+  `usage_metadata`, never assumed. `output/cache_metrics_<timestamp>.csv`
+  additionally records each cache's own `usage_metadata.total_token_count`
+  (the API's confirmation of how many tokens it actually stored) alongside
+  measured create/delete/active durations.
+- `test_approach_c.py` validates this lifecycle — cache creation, reuse
+  across all three calls, unconditional cleanup, and both cache-creation and
+  cache-deletion failure handling — against a mocked `google.genai.Client`,
+  so it runs without a live API key. It does not measure real cost or
+  latency; only a live run against `dc_data/` can do that.
+
+## What's held constant across A, B, and C, and what's deliberately different
 
 To keep the comparison fair, the test keeps these things the same:
 
 - Same documents, same Gemini model, same number of agents, same run count.
-- **Agents 2 and 3 use the same `prompt`** in both approaches. Only the
-  document they receive changes: extracted text in A, raw document in B.
-- **Agent 1 uses different instructions on purpose.** In A it produces the
-  reusable full text. In B, nothing uses its output, so it only checks
-  readability. This is set by the `approach_a_prompt` field for Agent 1 in
-  `agents_config.json`.
+- **Agents 2 and 3 use the same `prompt`** in all three approaches. Only the
+  document they receive changes: extracted text in A, the raw document
+  re-uploaded in B, a reference to the shared cache in C.
+- **Agent 1 uses different instructions on purpose, but only in A.** In A it
+  produces the reusable full text via `approach_a_prompt`. In both B and C,
+  nothing uses its output, so it only checks readability via the plain
+  `prompt` — C's Agent 1 is not a special case, it's identical to B's.
 - The agents do simple tasks so the test measures latency and token cost,
   rather than the quality of a real business process.
-- The two approaches run separately: A first, then B.
+- The three approaches run separately, never interleaved: A first, then B,
+  then C.
 
 ## What gets measured, per Gemini call
 
 `document_name, approach, agent_name, agent_number, run_index, start_time,
 end_time, latency_seconds, document_load_seconds, gemini_api_latency_seconds,
 total_agent_latency_seconds, input_token_count, output_token_count,
-total_token_count, model_name, success, error_message`
+total_token_count, model_name, success, error_message,
+cached_content_token_count`
 
-— written to `output/gemini_calls_<timestamp>.csv`, one row per call. A second
-file, `output/document_summary_<timestamp>.csv`, rolls this up to one row per
-document, approach, and run: total latency, total tokens, call count, and
-failures. The final console report compares mean, P50, and P95 latency, along
-with token totals and percentage differences.
+— written to `output/gemini_calls_<timestamp>.csv`, one row per call.
+`cached_content_token_count` is populated only when the API's `usage_metadata`
+reports it (Approach C calls that hit the cache); it's always empty for A/B
+and for any C call the API doesn't tag. A second file,
+`output/document_summary_<timestamp>.csv`, rolls this up to one row per
+document, approach, and run: total latency, total tokens, total cached
+tokens, call count, and failures. For Approach C only, a third file,
+`output/cache_metrics_<timestamp>.csv`, has one row per document/run: the
+cache's name, document-load/create/active/delete durations, the cache's own
+confirmed token count (from the cache's `usage_metadata`, not an estimate),
+and whether creation/deletion succeeded. The final console report compares
+mean, P50, and P95 latency, token totals, confirmed cache hits, and
+percentage differences, across all three approaches pairwise.
 
 ## Repo layout
 
@@ -171,6 +323,7 @@ with token totals and percentage differences.
 | `agents_config.json` | Agent names/prompts (editable, no code changes needed) |
 | `dc_data/` | Sample input documents |
 | `test_gemini_api.ipynb` | Minimal notebook to sanity-check API key/model before a full run |
+| `test_approach_c.py` | Mocked unit tests for Approach C's cache lifecycle (creation, reuse, cleanup, failure handling) |
 | `output/` | Generated CSVs (gitignored) |
 | `pricing_config.json` | Optional token pricing for cost estimates (see below) |
 
@@ -191,6 +344,10 @@ both approaches use the same model in the same run):
 | Avg input tokens | 534.3 | 1138.7 | +113.1% |
 | Avg output tokens | 94.2 | 40.3 | **-57.2%** |
 | Total tokens | 3,771 | 7,074 | +87.6% |
+
+This sample run predates Approach C, so it has no C column: it was captured
+before the cache-based architecture existed. A live run including Approach C
+has since been done — see the next section for what actually happened.
 
 Two distinct effects are visible here, matching the two architectures'
 actual token shapes:
@@ -294,6 +451,67 @@ full ~1,130-token document price instead of the ~230-token text price —
 that's where essentially all of the +113% average-input-token gap reported
 above comes from.
 
+## Live run including Approach C (2026-09-17)
+
+A full live run of `python gemini_architecture_benchmark.py
+--pricing-config pricing_config.json` against `dc_data/` (model
+`gemini-3.5-flash-lite`, this key's free tier) produced
+`output/gemini_calls_20260917_034208.csv`, `output/document_summary_20260917_034208.csv`,
+and `output/cache_metrics_20260917_034208.csv`. Approaches A and B completed
+normally, with token/latency shapes consistent with the earlier sample run
+above:
+
+| Metric | Approach A | Approach B | Approach C |
+|---|---:|---:|---:|
+| Gemini calls | 6 | 6 | 6 |
+| Failed calls | 0 | 0 | **6** |
+| Avg latency (s) | 1.224 | 1.868 | 0.000 |
+| Avg input tokens | 531.7 | 1138.7 | 0 |
+| Avg output tokens | 92.3 | 39.0 | 0 |
+| Total tokens | 3,744 | 7,066 | 0 |
+| Confirmed cache-hit calls | 0 | 0 | 0 |
+| Est. LLM cost (USD) | $0.0095 | $0.0109 | $0.0000 |
+
+**Approach C's cache creation failed for every document, with a real,
+specific error:**
+
+```
+429 RESOURCE_EXHAUSTED: TotalCachedContentStorageTokensPerModelFreeTier
+limit exceeded for model gemini-3.5-flash-lite: limit=0, requested=1081
+```
+
+That is Google's API reporting that this account's free tier has a **hard
+zero-token quota for cached content storage** — not a bug in this harness,
+and not specific to `gemini-3.5-flash-lite`: probing `caches.create()`
+directly against every other free-tier-accessible model on this key
+(`gemini-3.5-flash`, `gemini-flash-lite-latest`) returned the identical
+`limit=0` error, and the two paid-tier-only models this key can otherwise
+see (`gemini-2.5-flash`, `gemini-2.5-flash-lite`) returned `404` as
+already-deprecated for new users (see "A note on model access" in
+`README.md`). Context caching on this key requires a billing-enabled
+project, full stop — independent of which model is used.
+
+**This is exactly the failure path `run_approach_c()` and
+`test_approach_c.py`'s `test_cache_creation_failure_skips_all_agents_and_never_calls_delete`
+test were built for, and it behaved as designed in production:** all three
+agents for both documents were recorded as `success=False` with the real
+`cache creation failed: 429 RESOURCE_EXHAUSTED...` message (never silently
+dropped), no `generate_content` calls were attempted, and — since nothing
+was ever created — no delete call was made either (`cache_metrics_*.csv`
+shows `create_success=False, delete_success=True, cache_name=<empty>` for
+both documents). The run completed cleanly end to end rather than crashing.
+
+**What this means for the rest of this document:** every C-related cost/
+latency table above (the Executive Summary's Approach C section, the
+"Avg cached tokens/call" row, "Confirmed cache-hit calls") remains a
+*projection*, not a measurement — that was always the intent per the
+no-discount-assumed rule, but it's worth being explicit that this repo has
+not yet measured a real cache hit, because the account available for
+testing has zero free-tier cache quota. Getting real numbers needs a
+billing-enabled Google Cloud project linked to the API key; that's a Google
+Cloud Console change outside this harness's or this repo's control, and
+outside the scope of anything done here.
+
 ## Cost projection using Gemini 2.5 Pro pricing
 
 The harness doesn't assume any token price by default (see `README.md`
@@ -323,11 +541,23 @@ qualitative shape — B's input cost dominates and pushes its total above A,
 even though B's output cost is actually lower — follows directly from each
 architecture's structure and would hold on 2.5 Pro too.
 
+This section is deliberately A/B-only: it's built from the sample run's
+*measured* token counts, and no measured Approach C run exists yet (see
+"Results so far" above). Once one does, the same treatment applies to C's
+real numbers — with its cache-storage cost added as its own line, the same
+way the spreadsheet projection above keeps it separate rather than folding it
+into the per-token input/output cost.
+
 To get a live cost estimate on your own runs at whatever rates you choose,
 copy `pricing_config.example.json` to `pricing_config.json` (already done
 here, pre-filled with the 2.5 Pro rates above) and pass
-`--pricing-config pricing_config.json` — the harness adds an
-"Est. cost (USD)" row to its final report automatically.
+`--pricing-config pricing_config.json` — the harness adds an "Est. LLM cost
+(USD)" row to its final report automatically. Add an optional
+`cache_storage_cost_per_1m_tokens_per_hour` key to the same file to also get
+an "Est. cache storage (USD)" row for Approach C, computed from each cache's
+own measured size and active duration in `cache_metrics_<timestamp>.csv` —
+never from the nominal 1,290-token planning figure used in the spreadsheet
+above.
 
 ## Takeaway
 
@@ -343,3 +573,25 @@ extraction-quality bottleneck where one bad Agent-1 call breaks everyone
 downstream. The right choice depends on document size, output-token pricing,
 latency requirements, and whether that independence is worth the repeated
 multimodal input.
+
+Approach C is a bet that a short-lived cache can give B's independence
+without B's repeated upload cost. Structurally it can only help or be
+neutral relative to B — it never uploads the document more than once, and
+its cache-storage cost is small by design (a 1-minute TTL keeps the
+planning-case storage cost at about $1.21/month against a $111.75/month LLM
+bill). But per this document's own rule, none of that is a *claimed* saving:
+until a live run's `cached_content_token_count` and `cache_metrics` confirm
+it, Approach C's projected cost here is B's cost plus a small tax, not
+B's cost minus a discount. Whether it's worth adopting depends on whether
+that discount actually materializes on the model in use, and whether cache
+creation/deletion latency is small enough to be worth the input-token
+tradeoff for a given document size and agent count.
+
+That question remains open on this repo's own test account: the live run
+above shows cache creation itself is gated behind billing (`limit=0` on
+every free-tier model this key can reach), so Approach C's real cache-hit
+rate, latency, and discounted cost are still unmeasured here — not because
+the code doesn't work, but because nothing has been able to create a cache
+yet to measure. Anyone evaluating Approach C for their own account should
+expect the same free-tier gate and plan to test on a billing-enabled
+project before drawing conclusions about its actual savings.

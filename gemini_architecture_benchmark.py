@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Benchmark harness comparing two multi-agent document-processing architectures
-against the Gemini API.
+"""Benchmark harness comparing three multi-agent document-processing
+architectures against the Gemini API.
 
 Approach A ("extract once"): Agent 1 receives the original PDF/image and
 extracts its text. Agents 2..N receive ONLY that extracted text.
@@ -8,10 +8,15 @@ extracts its text. Agents 2..N receive ONLY that extracted text.
 Approach B ("reprocess"): every agent independently receives and reprocesses
 the original PDF/image.
 
-The two approaches are measured, not designed around a task -- agent prompts
-are deliberately simple/dummy (see agents_config.json) so what's being
-compared is architecture cost (latency, token usage), not business logic
-quality. See goal.txt and README.md for the full experiment design.
+Approach C ("cache once, query many"): the document is loaded and cached
+with the Gemini API exactly once; all agents make independent calls against
+that same cache instead of re-uploading the document or sharing a transcript.
+The cache is always deleted afterward, including when an agent call fails.
+
+The approaches are measured, not designed around a task -- agent prompts are
+deliberately simple/dummy (see agents_config.json) so what's being compared
+is architecture cost (latency, token usage), not business logic quality. See
+README.md for the full experiment design.
 """
 
 from __future__ import annotations
@@ -37,8 +42,14 @@ logger = logging.getLogger("gemini_architecture_benchmark")
 
 APPROACH_A = "A"
 APPROACH_B = "B"
+APPROACH_C = "C"
 
 SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
+
+# Approach C's context cache only needs to outlive the 3 agent calls made
+# against it; a short TTL keeps the (separately billed) cache-storage cost
+# negligible, which is the point of the "short-lived" design.
+CACHE_TTL_SECONDS = 60
 
 
 # --------------------------------------------------------------------------
@@ -204,8 +215,32 @@ class GeminiCallResult:
     input_token_count: Optional[int]
     output_token_count: Optional[int]
     total_token_count: Optional[int]
+    cached_content_token_count: Optional[int]
     start_time: datetime
     end_time: datetime
+
+
+@dataclass
+class CacheCreateResult:
+    """Result of creating a short-lived context cache for one document.
+
+    `cached_token_count` comes from the cache's own `usage_metadata`, i.e. the
+    API's confirmation of how many tokens it actually stored -- not an
+    assumption derived from file size or a nominal per-page estimate.
+    """
+
+    cache_name: Optional[str]
+    success: bool
+    error_message: Optional[str]
+    create_seconds: float
+    cached_token_count: Optional[int]
+
+
+@dataclass
+class CacheDeleteResult:
+    success: bool
+    error_message: Optional[str]
+    delete_seconds: float
 
 
 class GeminiClient:
@@ -216,12 +251,20 @@ class GeminiClient:
         self._client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
-    def call(self, contents: list) -> GeminiCallResult:
+    def call(self, contents: list, cached_content: Optional[str] = None) -> GeminiCallResult:
+        """Makes one generate_content call. When `cached_content` (a cache
+        resource name from create_cache) is given, the call references that
+        cache instead of resending document bytes in `contents`."""
         start_dt = datetime.now(timezone.utc)
         start = time.perf_counter()
         try:
+            config = (
+                types.GenerateContentConfig(cached_content=cached_content)
+                if cached_content
+                else None
+            )
             response = self._client.models.generate_content(
-                model=self.model_name, contents=contents
+                model=self.model_name, contents=contents, config=config
             )
             api_latency_seconds = time.perf_counter() - start
             end_dt = datetime.now(timezone.utc)
@@ -230,6 +273,7 @@ class GeminiClient:
             input_tokens = getattr(usage, "prompt_token_count", None) if usage else None
             output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
             total_tokens = getattr(usage, "total_token_count", None) if usage else None
+            cached_tokens = getattr(usage, "cached_content_token_count", None) if usage else None
 
             return GeminiCallResult(
                 text=response.text or "",
@@ -239,6 +283,7 @@ class GeminiClient:
                 input_token_count=input_tokens,
                 output_token_count=output_tokens,
                 total_token_count=total_tokens,
+                cached_content_token_count=cached_tokens,
                 start_time=start_dt,
                 end_time=end_dt,
             )
@@ -254,8 +299,54 @@ class GeminiClient:
                 input_token_count=None,
                 output_token_count=None,
                 total_token_count=None,
+                cached_content_token_count=None,
                 start_time=start_dt,
                 end_time=end_dt,
+            )
+
+    def create_cache(self, data: bytes, mime_type: str, ttl_seconds: int) -> CacheCreateResult:
+        """Creates a short-lived context cache holding one document."""
+        start = time.perf_counter()
+        try:
+            cache = self._client.caches.create(
+                model=self.model_name,
+                config=types.CreateCachedContentConfig(
+                    contents=[types.Part.from_bytes(data=data, mime_type=mime_type)],
+                    ttl=f"{ttl_seconds}s",
+                ),
+            )
+            cache_usage = getattr(cache, "usage_metadata", None)
+            cached_token_count = getattr(cache_usage, "total_token_count", None) if cache_usage else None
+            return CacheCreateResult(
+                cache_name=cache.name,
+                success=True,
+                error_message=None,
+                create_seconds=time.perf_counter() - start,
+                cached_token_count=cached_token_count,
+            )
+        except Exception as exc:  # noqa: BLE001 - cache creation can fail in many API-specific ways
+            logger.error("Cache creation failed: %s", exc)
+            return CacheCreateResult(
+                cache_name=None,
+                success=False,
+                error_message=str(exc),
+                create_seconds=time.perf_counter() - start,
+                cached_token_count=None,
+            )
+
+    def delete_cache(self, cache_name: str) -> CacheDeleteResult:
+        """Best-effort cache deletion. Never raises -- callers must be able to
+        unconditionally clean up from a `finally` block."""
+        start = time.perf_counter()
+        try:
+            self._client.caches.delete(name=cache_name)
+            return CacheDeleteResult(
+                success=True, error_message=None, delete_seconds=time.perf_counter() - start
+            )
+        except Exception as exc:  # noqa: BLE001 - deletion can fail in many API-specific ways
+            logger.error("Cache deletion failed for %s: %s", cache_name, exc)
+            return CacheDeleteResult(
+                success=False, error_message=str(exc), delete_seconds=time.perf_counter() - start
             )
 
 
@@ -285,6 +376,7 @@ class CallMetrics:
     model_name: str
     success: bool
     error_message: Optional[str]
+    cached_content_token_count: Optional[int] = None
 
 
 def _skipped_call_metrics(
@@ -348,6 +440,7 @@ def _call_metrics_from_result(
         model_name=model_name,
         success=result.success,
         error_message=result.error_message,
+        cached_content_token_count=result.cached_content_token_count,
     )
 
 
@@ -454,6 +547,119 @@ def run_approach_b(
     return metrics
 
 
+@dataclass
+class CacheMetrics:
+    """One row per document/run for Approach C: the lifecycle of the one
+    context cache shared by all of that document's agent calls."""
+
+    document_name: str
+    run_index: int
+    cache_name: Optional[str]
+    document_load_seconds: float
+    create_seconds: float
+    cache_active_seconds: float
+    delete_seconds: float
+    cached_token_count: Optional[int]
+    create_success: bool
+    delete_success: bool
+    error_message: Optional[str]
+
+
+def run_approach_c(
+    document_path: Path,
+    run_index: int,
+    config: Config,
+    agents: list[AgentDefinition],
+    client: GeminiClient,
+) -> tuple[list[CallMetrics], CacheMetrics]:
+    """Cache once, query many: the document is loaded and cached exactly
+    once, then every agent makes its own independent call against that same
+    cache instead of resending the document or sharing a transcript.
+
+    Agent 1 uses its plain `prompt` here, never `approach_a_prompt` -- like
+    Approach B, nothing downstream consumes Agent 1's output (the document
+    itself is shared via the cache, not via a transcript), so Agent 1 stays a
+    narrow legibility check rather than a full-text dump.
+
+    The cache is always deleted once the agents are done, even if one of them
+    fails or an unexpected exception is raised, via `finally` -- a cache is a
+    billed resource for as long as it exists, so cleanup must not depend on
+    every call having succeeded.
+    """
+    document_name = document_path.name
+
+    try:
+        loaded = load_document(document_path)
+    except Exception as exc:
+        logger.error("Failed to load %s: %s", document_path, exc)
+        error_message = f"document load failed: {exc}"
+        return (
+            [
+                _skipped_call_metrics(
+                    document_name, APPROACH_C, agent, run_index, config.model_name, error_message,
+                )
+                for agent in agents
+            ],
+            CacheMetrics(
+                document_name=document_name, run_index=run_index, cache_name=None,
+                document_load_seconds=0.0, create_seconds=0.0, cache_active_seconds=0.0,
+                delete_seconds=0.0, cached_token_count=None, create_success=False,
+                delete_success=True, error_message=error_message,
+            ),
+        )
+
+    cache_result = client.create_cache(loaded.data, loaded.mime_type, CACHE_TTL_SECONDS)
+
+    if not cache_result.success:
+        error_message = f"cache creation failed: {cache_result.error_message}"
+        return (
+            [
+                _skipped_call_metrics(
+                    document_name, APPROACH_C, agent, run_index, config.model_name, error_message,
+                )
+                for agent in agents
+            ],
+            CacheMetrics(
+                document_name=document_name, run_index=run_index, cache_name=None,
+                document_load_seconds=loaded.load_seconds, create_seconds=cache_result.create_seconds,
+                cache_active_seconds=0.0, delete_seconds=0.0, cached_token_count=None,
+                create_success=False, delete_success=True, error_message=cache_result.error_message,
+            ),
+        )
+
+    metrics: list[CallMetrics] = []
+    active_start = time.perf_counter()
+    delete_result: Optional[CacheDeleteResult] = None
+    try:
+        for agent in agents:
+            contents = [agent.prompt]
+            result = client.call(contents, cached_content=cache_result.cache_name)
+            metrics.append(
+                _call_metrics_from_result(
+                    document_name, APPROACH_C, agent, run_index, config.model_name,
+                    0.0, result,
+                )
+            )
+    finally:
+        cache_active_seconds = time.perf_counter() - active_start
+        delete_result = client.delete_cache(cache_result.cache_name)
+
+    cache_metrics = CacheMetrics(
+        document_name=document_name,
+        run_index=run_index,
+        cache_name=cache_result.cache_name,
+        document_load_seconds=loaded.load_seconds,
+        create_seconds=cache_result.create_seconds,
+        cache_active_seconds=cache_active_seconds,
+        delete_seconds=delete_result.delete_seconds,
+        cached_token_count=cache_result.cached_token_count,
+        create_success=True,
+        delete_success=delete_result.success,
+        error_message=delete_result.error_message,
+    )
+    return metrics, cache_metrics
+
+
 # --------------------------------------------------------------------------
 # Aggregation
 # --------------------------------------------------------------------------
@@ -468,21 +674,31 @@ class DocumentSummary:
     total_input_tokens: int
     total_output_tokens: int
     total_tokens: int
+    total_cached_tokens: int
     num_gemini_calls: int
     num_failed_calls: int
 
 
 def aggregate_per_document(
-    document_name: str, approach: str, run_index: int, calls: list[CallMetrics]
+    document_name: str,
+    approach: str,
+    run_index: int,
+    calls: list[CallMetrics],
+    extra_latency_seconds: float = 0.0,
 ) -> DocumentSummary:
+    """`extra_latency_seconds` covers architecture-specific overhead that
+    isn't attached to any individual agent call, such as Approach C's cache
+    create/delete round trips, so end-to-end latency stays comparable across
+    approaches."""
     return DocumentSummary(
         document_name=document_name,
         approach=approach,
         run_index=run_index,
-        total_end_to_end_latency_seconds=sum(c.latency_seconds for c in calls),
+        total_end_to_end_latency_seconds=sum(c.latency_seconds for c in calls) + extra_latency_seconds,
         total_input_tokens=sum(c.input_token_count or 0 for c in calls),
         total_output_tokens=sum(c.output_token_count or 0 for c in calls),
         total_tokens=sum(c.total_token_count or 0 for c in calls),
+        total_cached_tokens=sum(c.cached_content_token_count or 0 for c in calls),
         num_gemini_calls=len(calls),
         num_failed_calls=sum(1 for c in calls if not c.success),
     )
@@ -506,6 +722,9 @@ class ApproachStats:
     total_tokens: int
     avg_tokens_per_document: float
     estimated_cost_usd: Optional[float] = None
+    mean_cached_content_tokens: Optional[float] = None
+    num_calls_with_confirmed_cache_hit: int = 0
+    estimated_cache_storage_cost_usd: Optional[float] = None
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -529,6 +748,7 @@ def aggregate_overall(
     document_summaries: list[DocumentSummary],
     call_metrics: list[CallMetrics],
     pricing: Optional[dict] = None,
+    cache_metrics: Optional[list[CacheMetrics]] = None,
 ) -> ApproachStats:
     latencies = [c.latency_seconds for c in call_metrics]
     input_tokens = [c.input_token_count for c in call_metrics if c.input_token_count is not None]
@@ -538,12 +758,38 @@ def aggregate_overall(
     total_tokens = sum(c.total_token_count or 0 for c in call_metrics)
     num_documents = len({s.document_name for s in document_summaries})
 
+    # Cache hits are reported only when the API's own usage_metadata confirms
+    # them -- never assumed from cache creation succeeding or from a nominal
+    # token estimate. `cached_content_token_count` is None on every call for
+    # Approaches A/B and for any Approach C call the API didn't tag.
+    cached_tokens_seen = [
+        c.cached_content_token_count for c in call_metrics if c.cached_content_token_count is not None
+    ]
+    mean_cached_content_tokens = statistics.mean(cached_tokens_seen) if cached_tokens_seen else None
+    num_calls_with_confirmed_cache_hit = sum(1 for t in cached_tokens_seen if t > 0)
+
     estimated_cost = None
     if pricing:
         estimated_cost = (
             total_input_tokens / 1_000_000 * pricing["input_cost_per_1m_tokens"]
             + total_output_tokens / 1_000_000 * pricing["output_cost_per_1m_tokens"]
         )
+
+    # Cache storage cost is computed from each cache's own measured size
+    # (cached_token_count, from the cache's usage_metadata) and measured
+    # lifetime (cache_active_seconds) -- both API/clock facts, not estimates
+    # -- so it's kept as a separate line item rather than folded into
+    # estimated_cost above.
+    estimated_cache_storage_cost = None
+    if pricing and pricing.get("cache_storage_cost_per_1m_tokens_per_hour") and cache_metrics:
+        rate_per_hour = pricing["cache_storage_cost_per_1m_tokens_per_hour"]
+        total_storage_cost = 0.0
+        for cm in cache_metrics:
+            if cm.cached_token_count and cm.cache_active_seconds:
+                total_storage_cost += (
+                    cm.cached_token_count / 1_000_000 * rate_per_hour * (cm.cache_active_seconds / 3600)
+                )
+        estimated_cache_storage_cost = total_storage_cost
 
     return ApproachStats(
         approach=approach,
@@ -562,6 +808,9 @@ def aggregate_overall(
         total_tokens=total_tokens,
         avg_tokens_per_document=total_tokens / num_documents if num_documents else 0.0,
         estimated_cost_usd=estimated_cost,
+        mean_cached_content_tokens=mean_cached_content_tokens,
+        num_calls_with_confirmed_cache_hit=num_calls_with_confirmed_cache_hit,
+        estimated_cache_storage_cost_usd=estimated_cache_storage_cost,
     )
 
 
@@ -604,38 +853,72 @@ def write_document_summary_csv(path: Path, summaries: list[DocumentSummary]) -> 
             writer.writerow(asdict(summary))
 
 
-def print_final_report(stats_a: ApproachStats, stats_b: ApproachStats, diffs: dict[str, float]) -> None:
-    def row(label: str, a_val, b_val, fmt: str = "{:.3f}") -> str:
-        a_str = fmt.format(a_val) if isinstance(a_val, float) else str(a_val)
-        b_str = fmt.format(b_val) if isinstance(b_val, float) else str(b_val)
-        return f"{label:<20} {a_str:>18} {b_str:>18}"
+def write_cache_metrics_csv(path: Path, cache_metrics: list[CacheMetrics]) -> None:
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(asdict(cache_metrics[0]).keys()))
+        writer.writeheader()
+        for cm in cache_metrics:
+            writer.writerow(asdict(cm))
+
+
+def print_final_report(stats_list: list[ApproachStats]) -> None:
+    label_width = 26
+    col_width = 16
+    table_width = label_width + col_width * len(stats_list)
+
+    def row(label: str, values: list, fmt: str = "{:.3f}") -> str:
+        cells = [fmt.format(v) if isinstance(v, float) else str(v) for v in values]
+        return f"{label:<{label_width}}" + "".join(f"{c:>{col_width}}" for c in cells)
 
     lines = [
         "",
-        "=" * 60,
-        "APPROACH A vs APPROACH B - COMPARISON SUMMARY",
-        "=" * 60,
-        f"{'':<20} {'Approach A':>18} {'Approach B':>18}",
-        row("Documents", stats_a.num_documents, stats_b.num_documents, "{}"),
-        row("Agents", stats_a.num_agents, stats_b.num_agents, "{}"),
-        row("Runs per document", stats_a.num_runs, stats_b.num_runs, "{}"),
-        row("Gemini calls", stats_a.num_calls, stats_b.num_calls, "{}"),
-        row("Failed calls", stats_a.num_failed_calls, stats_b.num_failed_calls, "{}"),
-        row("Avg latency (s)", stats_a.mean_latency_seconds, stats_b.mean_latency_seconds),
-        row("P50 latency (s)", stats_a.p50_latency_seconds, stats_b.p50_latency_seconds),
-        row("P95 latency (s)", stats_a.p95_latency_seconds, stats_b.p95_latency_seconds),
-        row("Avg input tokens", stats_a.mean_input_tokens, stats_b.mean_input_tokens),
-        row("Avg output tokens", stats_a.mean_output_tokens, stats_b.mean_output_tokens),
-        row("Total tokens", stats_a.total_tokens, stats_b.total_tokens, "{}"),
-        row("Avg tokens/document", stats_a.avg_tokens_per_document, stats_b.avg_tokens_per_document),
+        "=" * table_width,
+        "APPROACH COMPARISON SUMMARY",
+        "=" * table_width,
+        row("", [f"Approach {s.approach}" for s in stats_list], "{}"),
+        row("Documents", [s.num_documents for s in stats_list], "{}"),
+        row("Agents", [s.num_agents for s in stats_list], "{}"),
+        row("Runs per document", [s.num_runs for s in stats_list], "{}"),
+        row("Gemini calls", [s.num_calls for s in stats_list], "{}"),
+        row("Failed calls", [s.num_failed_calls for s in stats_list], "{}"),
+        row("Avg latency (s)", [s.mean_latency_seconds for s in stats_list]),
+        row("P50 latency (s)", [s.p50_latency_seconds for s in stats_list]),
+        row("P95 latency (s)", [s.p95_latency_seconds for s in stats_list]),
+        row("Avg input tokens", [s.mean_input_tokens for s in stats_list]),
+        row("Avg output tokens", [s.mean_output_tokens for s in stats_list]),
+        row("Total tokens", [s.total_tokens for s in stats_list], "{}"),
+        row("Avg tokens/document", [s.avg_tokens_per_document for s in stats_list]),
+        row(
+            "Avg cached tokens/call",
+            [s.mean_cached_content_tokens or 0.0 for s in stats_list],
+        ),
+        row(
+            "Confirmed cache-hit calls",
+            [s.num_calls_with_confirmed_cache_hit for s in stats_list],
+            "{}",
+        ),
     ]
-    if stats_a.estimated_cost_usd is not None:
-        lines.append(row("Est. cost (USD)", stats_a.estimated_cost_usd, stats_b.estimated_cost_usd, "{:.4f}"))
-    lines.append("-" * 60)
-    lines.append("Percentage difference, B vs A (positive = B is higher):")
-    for key, value in diffs.items():
-        lines.append(f"  {key:<24} {value:+.1f}%")
-    lines.append("=" * 60)
+    if any(s.estimated_cost_usd is not None for s in stats_list):
+        lines.append(
+            row("Est. LLM cost (USD)", [s.estimated_cost_usd or 0.0 for s in stats_list], "{:.4f}")
+        )
+    if any(s.estimated_cache_storage_cost_usd is not None for s in stats_list):
+        lines.append(
+            row(
+                "Est. cache storage (USD)",
+                [s.estimated_cache_storage_cost_usd or 0.0 for s in stats_list],
+                "{:.6f}",
+            )
+        )
+    lines.append("-" * table_width)
+    lines.append("Pairwise percentage differences (positive = the second approach is higher):")
+    for i in range(len(stats_list)):
+        for j in range(i + 1, len(stats_list)):
+            diffs = percentage_difference(stats_list[i], stats_list[j])
+            lines.append(f"  {stats_list[j].approach} vs {stats_list[i].approach}:")
+            for key, value in diffs.items():
+                lines.append(f"    {key:<24} {value:+.1f}%")
+    lines.append("=" * table_width)
     print("\n".join(lines))
 
 
@@ -658,30 +941,47 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     client = GeminiClient(api_key=config.gemini_api_key, model_name=config.model_name)
 
-    total_expected_calls = len(documents) * config.num_runs * config.num_agents * 2
+    total_expected_calls = len(documents) * config.num_runs * config.num_agents * 3
     logger.info(
         "Starting experiment: %d document(s), %d agent(s), %d run(s)/document, "
-        "2 approaches -> up to %d Gemini calls",
+        "3 approaches -> up to %d Gemini calls",
         len(documents), config.num_agents, config.num_runs, total_expected_calls,
     )
 
     all_calls: list[CallMetrics] = []
     all_summaries: list[DocumentSummary] = []
+    all_cache_metrics: list[CacheMetrics] = []
 
     # Each approach runs sequentially across all documents/runs, per the
     # experiment's reproducibility requirement -- approaches are never
     # interleaved so nothing from one contaminates the other's measurement.
-    for approach_name, runner in ((APPROACH_A, run_approach_a), (APPROACH_B, run_approach_b)):
+    for approach_name, runner in (
+        (APPROACH_A, run_approach_a),
+        (APPROACH_B, run_approach_b),
+        (APPROACH_C, run_approach_c),
+    ):
         for run_index in range(config.num_runs):
             for document_path in documents:
                 logger.info(
                     "Approach %s, run %d/%d, document '%s'",
                     approach_name, run_index + 1, config.num_runs, document_path.name,
                 )
-                calls = runner(document_path, run_index, config, agents, client)
+                extra_latency_seconds = 0.0
+                if approach_name == APPROACH_C:
+                    calls, cache_metrics = runner(document_path, run_index, config, agents, client)
+                    all_cache_metrics.append(cache_metrics)
+                    extra_latency_seconds = (
+                        cache_metrics.document_load_seconds
+                        + cache_metrics.create_seconds
+                        + cache_metrics.delete_seconds
+                    )
+                else:
+                    calls = runner(document_path, run_index, config, agents, client)
                 all_calls.extend(calls)
                 all_summaries.append(
-                    aggregate_per_document(document_path.name, approach_name, run_index, calls)
+                    aggregate_per_document(
+                        document_path.name, approach_name, run_index, calls, extra_latency_seconds
+                    )
                 )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -691,16 +991,23 @@ def main(argv: Optional[list[str]] = None) -> None:
     write_document_summary_csv(summary_csv_path, all_summaries)
     logger.info("Wrote %s and %s", calls_csv_path, summary_csv_path)
 
-    calls_a = [c for c in all_calls if c.approach == APPROACH_A]
-    calls_b = [c for c in all_calls if c.approach == APPROACH_B]
-    summaries_a = [s for s in all_summaries if s.approach == APPROACH_A]
-    summaries_b = [s for s in all_summaries if s.approach == APPROACH_B]
+    if all_cache_metrics:
+        cache_csv_path = config.output_folder / f"cache_metrics_{timestamp}.csv"
+        write_cache_metrics_csv(cache_csv_path, all_cache_metrics)
+        logger.info("Wrote %s", cache_csv_path)
 
-    stats_a = aggregate_overall(APPROACH_A, config.num_agents, config.num_runs, summaries_a, calls_a, pricing)
-    stats_b = aggregate_overall(APPROACH_B, config.num_agents, config.num_runs, summaries_b, calls_b, pricing)
-    diffs = percentage_difference(stats_a, stats_b)
+    stats_list = []
+    for approach_name in (APPROACH_A, APPROACH_B, APPROACH_C):
+        calls = [c for c in all_calls if c.approach == approach_name]
+        summaries = [s for s in all_summaries if s.approach == approach_name]
+        cache_metrics = all_cache_metrics if approach_name == APPROACH_C else None
+        stats_list.append(
+            aggregate_overall(
+                approach_name, config.num_agents, config.num_runs, summaries, calls, pricing, cache_metrics
+            )
+        )
 
-    print_final_report(stats_a, stats_b, diffs)
+    print_final_report(stats_list)
 
 
 if __name__ == "__main__":
