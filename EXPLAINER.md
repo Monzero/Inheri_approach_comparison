@@ -18,182 +18,74 @@ documents, model, and questions, changing only the architecture.
 
 ## Executive Summary
 
-For **2,500 applications per month**, with **5 documents per application** and
-about **700 text tokens per document**, the monthly total is 12,500 documents.
-For this planning estimate, each document is a **5-page PDF**. Google's
-document-processing guidance assigns approximately **258 input tokens per PDF
-page**, so the raw PDF representation is **1,290 tokens per document**. The
-700-token transcript is counted separately only when Approach A sends that
-text to Agents 2 and 3.
-Using the Gemini 3.1 Pro Preview prices above ($2 per 1M input tokens and $12
-per 1M output tokens), the estimate is:
+### Assumptions
 
-| Metric | Approach A (extract once) | Approach B (reprocess) | Difference |
+| Item | Value |
+|---|---:|
+| Applications per month | 2,500 |
+| Documents per application | 5 |
+| Total documents per month | 12,500 |
+| PDF pages per document | 5 |
+| PDF tokens per page | 258 |
+| Raw PDF tokens per document | 1,290 |
+| Extracted text per document | 700 |
+| Gemini 3.1 Pro Preview input price | $2 / 1M tokens |
+| Gemini 3.1 Pro Preview output price | $12 / 1M tokens |
+
+### Approach A — Extract once
+
+| Calculation | Result |
+|---|---:|
+| Input per document | 1,290 PDF + 700 text + 700 text = **2,690** |
+| Output per document | **800** |
+| Monthly input tokens | 2,690 x 12,500 = **33.625M** |
+| Monthly output tokens | 800 x 12,500 = **10.00M** |
+| Monthly input cost | 33.625M x $2 = **$67.25** |
+| Monthly output cost | 10.00M x $12 = **$120.00** |
+| **Total monthly cost** | **$187.25** |
+
+### Approach B — Reprocess
+
+| Calculation | Result |
+|---|---:|
+| Input per document | 1,290 PDF x 3 agents = **3,870** |
+| Output per document | **100** |
+| Monthly input tokens | 3,870 x 12,500 = **48.375M** |
+| Monthly output tokens | 100 x 12,500 = **1.25M** |
+| Monthly input cost | 48.375M x $2 = **$96.75** |
+| Monthly output cost | 1.25M x $12 = **$15.00** |
+| **Total monthly cost** | **$111.75** |
+
+### Final comparison
+
+| | Approach A | Approach B | Difference |
 |---|---:|---:|---:|
 | Input tokens per document | 2,690 | 3,870 | B uses 1,180 more |
 | Output tokens per document | 800 | 100 | A uses 700 more |
-| Input-token cost per document | $0.00538 | $0.00774 | B costs $0.00236 more |
-| Output-token cost per document | $0.00960 | $0.00120 | A costs $0.00840 more |
-| **Total cost per document** | **$0.01498** | **$0.00894** | **B saves $0.00604** |
-| **Total cost per application** | **$0.07490** | **$0.04470** | **B saves $0.03020** |
-| **Total monthly cost** | **$187.25** | **$111.75** | **B saves $75.50** |
-| Sequential agent latency per document | **6.84s** | **13.37s** | **A is 6.52s faster** |
+| **Monthly cost** | **$187.25** | **$111.75** | **B saves $75.50** |
+| Sequential latency per document | **6.84s** | **13.37s** | **A is 6.52s faster** |
 
-### Spreadsheet-style monthly roll-up
-
-#### Approach A — Extract once
-
-| Input | Value |
-|---|---:|
-| PDF pages per document | 5 |
-| Document input tokens per page | 258 |
-| Raw PDF input tokens per document | 1,290 |
-| Extracted text passed to Agents 2 and 3 | 700 each |
-| Total input tokens per document | 2,690 |
-| Number of documents per application | 5 |
-| Input tokens per application | 13,450 |
-| Number of applications | 2,500 |
-| Monthly input tokens | 33.625M |
-| Monthly input cost at $2 / 1M | $67.25 |
-| Output tokens per document | 800 |
-| Monthly output tokens | 10.00M |
-| Monthly output cost at $12 / 1M | $120.00 |
-| **Total monthly cost** | **$187.25** |
-
-#### Approach B — Reprocess
-
-| Input | Value |
-|---|---:|
-| PDF pages per document | 5 |
-| Document input tokens per page | 258 |
-| Raw PDF input tokens per document | 1,290 |
-| Number of agents | 3 |
-| Total input tokens per document | 3,870 |
-| Number of documents per application | 5 |
-| Input tokens per application | 29,700 |
-| Number of applications | 2,500 |
-| Monthly input tokens | 48.375M |
-| Monthly input cost at $2 / 1M | $96.75 |
-| Output tokens per document | 100 |
-| Monthly output tokens | 1.25M |
-| Monthly output cost at $12 / 1M | $15.00 |
-| **Total monthly cost** | **$111.75** |
-
-### Token breakdown by agent
-
-This is the part that is easy to miss: the raw PDF input is the same for Agent
-1 in both approaches. The difference is what happens afterward. Approach A
-sends the extracted 700-token transcript to Agents 2 and 3, while Approach B
-sends the 5-page PDF to all three agents:
-
-| Agent | Approach A input | Approach B input | Approach A output | Approach B output |
-|---|---:|---:|---:|---:|
-| Agent 1: extraction / legibility | 1,290 raw PDF tokens | 1,290 raw PDF tokens | 800 transcript tokens | 100 answer tokens |
-| Agent 2: classification | 700 extracted-text tokens | 1,290 raw PDF tokens | Included in 800 | Included in 100 |
-| Agent 3: schema extraction | 700 extracted-text tokens | 1,290 raw PDF tokens | Included in 800 | Included in 100 |
-| **Total per document** | **2,690** | **3,870** | **800** | **100** |
-
-So Approach A uses **1,180 fewer input tokens per document**, or **30.5% less**
-than Approach B under this PDF model. Approach B sends the 1,290-token raw PDF
-three times, while Approach A sends it once and sends the 700-token extracted
-text to each later agent.
-
-### Pricing comparison
-
-The token counts and architecture stay exactly the same; only the model price
-changes:
-
-| Model | Approach A monthly cost | Approach B monthly cost | B saves |
-|---|---:|---:|---:|
-| Gemini 2.5 Pro ($1.25 input / $10 output per 1M) | $142.03 | $72.97 | $69.06 |
-| **Gemini 3.1 Pro Preview ($2 input / $12 output per 1M)** | **$187.25** | **$111.75** | **$75.50** |
-
-Source for both model rates: [Gemini Developer API pricing — ai.google.dev](https://ai.google.dev/gemini-api/docs/pricing).
-Gemini 3.1 Pro Preview's output price includes thinking tokens.
-
-The relative difference gets smaller with Gemini 3.1 Pro Preview: B is about
-**48.6% cheaper** with Gemini 2.5 Pro and about **40.3% cheaper** with Gemini
-3.1 Pro Preview. The input rate rises from $1.25 to $2.00 per 1M tokens, while
-the output rate rises from $10 to $12. Because Approach A has the much larger
-800-token output, the output price has a strong effect on both approaches.
-
-| Model | A's input-cost advantage over B | A's output-cost disadvantage | Net B saving per document |
-|---|---:|---:|---:|
-| Gemini 2.5 Pro | $0.00148 | $0.00840 | $0.00693 |
-| Gemini 3.1 Pro Preview | $0.00236 | $0.00840 | $0.00604 |
-
-With this PDF model, Approach B is estimated to cost about 40.3% less than
-Approach A, even though it takes about 95.4% longer per document once
-artifact-store loading is included. The main reason for the cost difference is
-that, in Approach A, Agent 1 has to produce the full 700-token transcript.
-Output tokens cost much more than input tokens. Approach A sends less document
-data and is faster in the measured benchmark, while Approach B avoids the long
-transcription but resends the original document to all three agents.
-
-For the cost arithmetic, Approach A uses **2,690 input tokens per document**:
-1,290 tokens for the raw 5-page PDF plus 700 extracted-text tokens for each of
-Agents 2 and 3. It uses **800 output tokens**. Approach B sends the 1,290-token
-raw PDF to all three agents, for **3,870 input tokens**, and uses **100 output
-tokens**. These are the input and output totals used in the tables above.
-
-The 700 text tokens are treated as Agent 1's transcript output and as text
-input to Agents 2 and 3; they are not automatically added again to the raw
-multimodal input. They would be added separately only if the same text were
-also sent alongside the document image. For an exact production number, pass
-the actual document and prompts to Gemini's `count_tokens()`.
-
-The estimate also uses the sample's prompt overhead and downstream output sizes.
-For an exact production number, pass the actual document and prompts to
-`count_tokens()` and use the resulting input counts in the pricing formula.
-
-The cost estimate assumes one extraction, one classification, and one schema
-extraction call per document, using the sample's output sizes for the
-downstream agents. The latency estimate uses the sample's average time for
-one document and adds **3 seconds every time the raw document is loaded from
-the artifact store**. Approach A loads each document once, adding 3 seconds;
-Approach B loads each document for all three agents, adding 9 seconds. The
-agents run sequentially for each document, while the five documents in one
-application can be processed in parallel. So application wall-clock latency
-can be close to the per-document latency when those five document jobs run
-concurrently, even though total compute and API usage still scale with five
-documents. The latency figures remain based on the measured benchmark plus
-artifact-store loading. A production rerun with representative documents would
-be the best final check.
-
-The two cost columns use different prices: Gemini 3.1 Pro Preview charges $2 per
-1M input tokens and $12 per 1M output tokens. In other words, one output token
-costs six times as much as one input token. That is why Approach A's 800 output
-tokens cost more than its 2,690 input tokens, while Approach B's 3,870 input
-tokens remain relatively inexpensive compared with its 100 output tokens.
+The main idea is simple: Approach A saves input tokens by reusing the extracted
+text, but it produces a much larger output. Approach B spends more on input
+tokens, but it avoids the 700-token transcript. These figures use the official
+Gemini 3.1 Pro Preview rates; exact PDF usage should be confirmed with
+`count_tokens()` and response `usage_metadata`.
 
 ### How PDF tokens are counted
 
-For a native or scanned PDF, it is better to think of the PDF page as a
-document/vision input rather than as ordinary text pasted into the prompt.
-Google's document-processing guidance assigns approximately **258 tokens per
-PDF page**, so the five-page document in this estimate contributes:
+For a native or scanned PDF, think of each page as document/vision input rather
+than ordinary text pasted into the prompt. Google's guidance assigns
+approximately **258 tokens per PDF page**, so:
 
 ```text
 5 pages x 258 tokens = 1,290 raw PDF input tokens
 ```
 
-For a scanned PDF, Gemini also uses OCR to understand the text in the page
-image. Google's media-resolution guidance describes scanned-PDF processing as
-`256 + OCR`; this does not mean that the OCR text should always be added as a
-second, independently billable pool on top of the page representation. The
-exact count depends on the document and processing configuration, so the
-production value should come from `count_tokens()` and the response
+For scanned PDFs, Gemini also uses OCR. Google's media-resolution guidance
+describes scanned-PDF processing as `256 + OCR`; OCR should not automatically
+be added as a second independently billable pool on top of the page
+representation. The exact value should come from `count_tokens()` and
 `usage_metadata`.
-
-The current spreadsheet model therefore uses 1,290 as the raw PDF input count
-and treats the 700-token transcript as a separate text input only for Approach
-A's Agents 2 and 3. This avoids double-counting OCR text inside the PDF input.
-
-For image files rather than PDFs, Gemini's image tokenization depends on image
-dimensions and tiling. An image at or below 384 pixels in both dimensions is
-counted as 258 tokens; larger images can be split into 768x768 tiles, with
-approximately 258 tokens per tile. That image rule should not be silently
-substituted for the PDF rule above.
 
 ## Approach A — "Extract once"
 
