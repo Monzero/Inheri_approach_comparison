@@ -1,59 +1,199 @@
 # Gemini Document-Processing Architecture Benchmark — Explainer
 
 This document explains what the benchmark harness in this repo does, the two
-architectures it compares, and how to read the results it produces —
-including a cost projection using published Gemini 2.5 Pro pricing.
+architectures it compares, and how to read the results — including a cost
+estimate using published Gemini 3.1 Pro Preview pricing.
 
 ## The question being answered
 
 When a pipeline runs several agents over the same document, there are two
-natural ways to give each agent access to the document's content:
+straightforward ways to give each agent access to the document:
 
-1. **Extract the text once, and pass that text to every downstream agent.**
+1. **Extract the text once, then pass it to every downstream agent.**
 2. **Give every agent the raw document and let it reprocess it independently.**
 
-These have very different cost profiles once documents are large or the
-number of agents grows, but the difference is easy to hand-wave about and
-hard to actually quantify without measuring it. This harness measures it:
-same documents, same model, equivalent prompts, only the architecture
-differs.
+These choices can have very different cost profiles as documents get longer or
+more agents are added. The harness measures the difference using the same
+documents, model, and questions, changing only the architecture.
 
 ## Executive Summary
 
-For a workload of **2,500 applications per month**, with **5 documents per
-application** and approximately **700 text tokens per document**, the monthly
-volume is 12,500 documents. Using the measured sample averages and the Gemini
-2.5 Pro rates above ($1.25 per 1M input tokens and $10 per 1M output tokens):
+For **2,500 applications per month**, with **5 documents per application** and
+about **700 text tokens per document**, the monthly total is 12,500 documents.
+For this planning estimate, each document is a **5-page PDF**. Google's
+document-processing guidance assigns approximately **258 input tokens per PDF
+page**, so the raw PDF representation is **1,290 tokens per document**. The
+700-token transcript is counted separately only when Approach A sends that
+text to Agents 2 and 3.
+Using the Gemini 3.1 Pro Preview prices above ($2 per 1M input tokens and $12
+per 1M output tokens), the estimate is:
 
 | Metric | Approach A (extract once) | Approach B (reprocess) | Difference |
 |---|---:|---:|---:|
-| Estimated cost per document | $0.011238 | $0.005480 | B saves $0.005758 |
-| Estimated cost per application | **$0.0562** | **$0.0274** | **B saves $0.0288** |
-| Estimated monthly cost | **$140.47** | **$68.50** | **B saves $71.97** |
+| Input tokens per document | 2,690 | 3,870 | B uses 1,180 more |
+| Output tokens per document | 800 | 100 | A uses 700 more |
+| Input-token cost per document | $0.00538 | $0.00774 | B costs $0.00236 more |
+| Output-token cost per document | $0.00960 | $0.00120 | A costs $0.00840 more |
+| **Total cost per document** | **$0.01498** | **$0.00894** | **B saves $0.00604** |
+| **Total cost per application** | **$0.07490** | **$0.04470** | **B saves $0.03020** |
+| **Total monthly cost** | **$187.25** | **$111.75** | **B saves $75.50** |
 | Sequential agent latency per document | **6.84s** | **13.37s** | **A is 6.52s faster** |
 
-At this larger document-text size, Approach B is estimated to cost about 51.2%
-less than Approach A, even though it takes about 95.4% longer per document once
-artifact-store loading is included. The cost reversal happens because Approach
-A must emit the full 700-token transcription, and output tokens cost much more
-than input tokens. Approach A uses fewer input tokens and is faster in the
-measured sequential benchmark; Approach B avoids the large transcription
-output but resends each document to all three agents.
+### Spreadsheet-style monthly roll-up
+
+#### Approach A — Extract once
+
+| Input | Value |
+|---|---:|
+| PDF pages per document | 5 |
+| Document input tokens per page | 258 |
+| Raw PDF input tokens per document | 1,290 |
+| Extracted text passed to Agents 2 and 3 | 700 each |
+| Total input tokens per document | 2,690 |
+| Number of documents per application | 5 |
+| Input tokens per application | 13,450 |
+| Number of applications | 2,500 |
+| Monthly input tokens | 33.625M |
+| Monthly input cost at $2 / 1M | $67.25 |
+| Output tokens per document | 800 |
+| Monthly output tokens | 10.00M |
+| Monthly output cost at $12 / 1M | $120.00 |
+| **Total monthly cost** | **$187.25** |
+
+#### Approach B — Reprocess
+
+| Input | Value |
+|---|---:|
+| PDF pages per document | 5 |
+| Document input tokens per page | 258 |
+| Raw PDF input tokens per document | 1,290 |
+| Number of agents | 3 |
+| Total input tokens per document | 3,870 |
+| Number of documents per application | 5 |
+| Input tokens per application | 29,700 |
+| Number of applications | 2,500 |
+| Monthly input tokens | 48.375M |
+| Monthly input cost at $2 / 1M | $96.75 |
+| Output tokens per document | 100 |
+| Monthly output tokens | 1.25M |
+| Monthly output cost at $12 / 1M | $15.00 |
+| **Total monthly cost** | **$111.75** |
+
+### Token breakdown by agent
+
+This is the part that is easy to miss: the raw PDF input is the same for Agent
+1 in both approaches. The difference is what happens afterward. Approach A
+sends the extracted 700-token transcript to Agents 2 and 3, while Approach B
+sends the 5-page PDF to all three agents:
+
+| Agent | Approach A input | Approach B input | Approach A output | Approach B output |
+|---|---:|---:|---:|---:|
+| Agent 1: extraction / legibility | 1,290 raw PDF tokens | 1,290 raw PDF tokens | 800 transcript tokens | 100 answer tokens |
+| Agent 2: classification | 700 extracted-text tokens | 1,290 raw PDF tokens | Included in 800 | Included in 100 |
+| Agent 3: schema extraction | 700 extracted-text tokens | 1,290 raw PDF tokens | Included in 800 | Included in 100 |
+| **Total per document** | **2,690** | **3,870** | **800** | **100** |
+
+So Approach A uses **1,180 fewer input tokens per document**, or **30.5% less**
+than Approach B under this PDF model. Approach B sends the 1,290-token raw PDF
+three times, while Approach A sends it once and sends the 700-token extracted
+text to each later agent.
+
+### Pricing comparison
+
+The token counts and architecture stay exactly the same; only the model price
+changes:
+
+| Model | Approach A monthly cost | Approach B monthly cost | B saves |
+|---|---:|---:|---:|
+| Gemini 2.5 Pro ($1.25 input / $10 output per 1M) | $142.03 | $72.97 | $69.06 |
+| **Gemini 3.1 Pro Preview ($2 input / $12 output per 1M)** | **$187.25** | **$111.75** | **$75.50** |
+
+Source for both model rates: [Gemini Developer API pricing — ai.google.dev](https://ai.google.dev/gemini-api/docs/pricing).
+Gemini 3.1 Pro Preview's output price includes thinking tokens.
+
+The relative difference gets smaller with Gemini 3.1 Pro Preview: B is about
+**48.6% cheaper** with Gemini 2.5 Pro and about **40.3% cheaper** with Gemini
+3.1 Pro Preview. The input rate rises from $1.25 to $2.00 per 1M tokens, while
+the output rate rises from $10 to $12. Because Approach A has the much larger
+800-token output, the output price has a strong effect on both approaches.
+
+| Model | A's input-cost advantage over B | A's output-cost disadvantage | Net B saving per document |
+|---|---:|---:|---:|
+| Gemini 2.5 Pro | $0.00148 | $0.00840 | $0.00693 |
+| Gemini 3.1 Pro Preview | $0.00236 | $0.00840 | $0.00604 |
+
+With this PDF model, Approach B is estimated to cost about 40.3% less than
+Approach A, even though it takes about 95.4% longer per document once
+artifact-store loading is included. The main reason for the cost difference is
+that, in Approach A, Agent 1 has to produce the full 700-token transcript.
+Output tokens cost much more than input tokens. Approach A sends less document
+data and is faster in the measured benchmark, while Approach B avoids the long
+transcription but resends the original document to all three agents.
+
+For the cost arithmetic, Approach A uses **2,690 input tokens per document**:
+1,290 tokens for the raw 5-page PDF plus 700 extracted-text tokens for each of
+Agents 2 and 3. It uses **800 output tokens**. Approach B sends the 1,290-token
+raw PDF to all three agents, for **3,870 input tokens**, and uses **100 output
+tokens**. These are the input and output totals used in the tables above.
+
+The 700 text tokens are treated as Agent 1's transcript output and as text
+input to Agents 2 and 3; they are not automatically added again to the raw
+multimodal input. They would be added separately only if the same text were
+also sent alongside the document image. For an exact production number, pass
+the actual document and prompts to Gemini's `count_tokens()`.
+
+The estimate also uses the sample's prompt overhead and downstream output sizes.
+For an exact production number, pass the actual document and prompts to
+`count_tokens()` and use the resulting input counts in the pricing formula.
 
 The cost estimate assumes one extraction, one classification, and one schema
-extraction call per document, with the sample's measured output sizes for the
-downstream agents. The latency estimate applies the measured mean per-document
-latencies to one document and adds **3 seconds for every raw-document load from
-the artifact store**. Approach A loads each document once, adding 3 seconds per
-document. Approach B loads each document for all three agents, adding 9 seconds
-per document. The agents are assumed to run sequentially, not in parallel,
-while the five documents within one application can be processed in parallel.
-Therefore, the application wall-clock latency can be approximately the
-per-document latency when all five document jobs run concurrently, although
-total compute and API usage still scale with five documents. This does not
-model any additional latency caused by a 700-token transcription, so a
-production rerun with representative documents should be used for final
-latency planning.
+extraction call per document, using the sample's output sizes for the
+downstream agents. The latency estimate uses the sample's average time for
+one document and adds **3 seconds every time the raw document is loaded from
+the artifact store**. Approach A loads each document once, adding 3 seconds;
+Approach B loads each document for all three agents, adding 9 seconds. The
+agents run sequentially for each document, while the five documents in one
+application can be processed in parallel. So application wall-clock latency
+can be close to the per-document latency when those five document jobs run
+concurrently, even though total compute and API usage still scale with five
+documents. The latency figures remain based on the measured benchmark plus
+artifact-store loading. A production rerun with representative documents would
+be the best final check.
+
+The two cost columns use different prices: Gemini 3.1 Pro Preview charges $2 per
+1M input tokens and $12 per 1M output tokens. In other words, one output token
+costs six times as much as one input token. That is why Approach A's 800 output
+tokens cost more than its 2,690 input tokens, while Approach B's 3,870 input
+tokens remain relatively inexpensive compared with its 100 output tokens.
+
+### How PDF tokens are counted
+
+For a native or scanned PDF, it is better to think of the PDF page as a
+document/vision input rather than as ordinary text pasted into the prompt.
+Google's document-processing guidance assigns approximately **258 tokens per
+PDF page**, so the five-page document in this estimate contributes:
+
+```text
+5 pages x 258 tokens = 1,290 raw PDF input tokens
+```
+
+For a scanned PDF, Gemini also uses OCR to understand the text in the page
+image. Google's media-resolution guidance describes scanned-PDF processing as
+`256 + OCR`; this does not mean that the OCR text should always be added as a
+second, independently billable pool on top of the page representation. The
+exact count depends on the document and processing configuration, so the
+production value should come from `count_tokens()` and the response
+`usage_metadata`.
+
+The current spreadsheet model therefore uses 1,290 as the raw PDF input count
+and treats the 700-token transcript as a separate text input only for Approach
+A's Agents 2 and 3. This avoids double-counting OCR text inside the PDF input.
+
+For image files rather than PDFs, Gemini's image tokenization depends on image
+dimensions and tiling. An image at or below 384 pixels in both dimensions is
+counted as 258 tokens; larger images can be split into 768x768 tiles, with
+approximately 258 tokens per tile. That image rule should not be silently
+substituted for the PDF rule above.
 
 ## Approach A — "Extract once"
 
@@ -65,23 +205,19 @@ flowchart LR
 ```
 
 - The original document is loaded and sent to Gemini **once**, to Agent 1.
-- Agent 1's job here is specifically to transcribe the document: extract all
-  readable text verbatim. That's a necessarily large-output task, because
-  the whole point is to produce the text every downstream agent will use.
-- Agent 1's raw text output is stored and reused **verbatim** — no
-  re-extraction, no editing, no summarizing it further.
-- Every downstream agent (2, 3, ...) receives that stored text as plain text
-  input and asks its own narrow question of it (classify it / pull specific
-  fields as JSON); it never sees the original file again.
-- Only Agent 1's Gemini call is multimodal (document bytes + prompt);
-  Agents 2..N are text-only calls.
+- Agent 1 extracts all readable text verbatim. This is a large-output task
+  because the later agents will use that text.
+- Agent 1's raw text output is saved and reused **verbatim** — no re-extraction,
+  editing, or summarizing.
+- The downstream agents receive the saved text and ask focused questions,
+  such as classification or field extraction. They never see the original file.
+- Only Agent 1's Gemini call is multimodal (document bytes plus prompt);
+  Agents 2 and 3 are text-only calls.
 
-**Cost shape**: document-processing cost (loading + the large multimodal
-input) is paid exactly once per document, no matter how many agents run
-afterward. The one unavoidable expense is Agent 1's large *output* (the
-transcription itself), which then becomes cheap, reusable input for
-everyone downstream. Downstream agents pay only for that extracted text as
-input plus their own small JSON/classification output.
+**Cost in simple terms**: the document-processing cost, including the large
+multimodal input, is paid once per document. The main extra cost is Agent 1's
+large transcription output, which then becomes reusable input for the
+downstream agents.
 
 ## Approach B — "Reprocess"
 
@@ -92,50 +228,35 @@ flowchart LR
     DOC -->|multimodal input, reloaded| B3[Agent 3\nSchema Extraction]
 ```
 
-- Every agent independently loads the original document from disk and sends
-  it to Gemini as multimodal input.
-- Agents are fully independent — none of them depend on another agent's
-  output, and there is no shared extracted-text state at all.
-- Crucially, **Agent 1's job is different here too**: since nothing
-  downstream consumes its output, it has no reason to transcribe the whole
-  document. It asks its own narrow question instead — "is this document
-  legible?" — and returns a small 2-field JSON verdict, exactly like Agents
-  2 and 3 ask their own narrow questions ("what category is this?" /
-  "what are these specific field values?"). All three agents' prompts avoid
-  asking for free-text explanations (no "justification", no "notes") so
-  their output size reflects the answer itself, not incidental prose.
-- The document is loaded from disk **N times** (once per agent), and that
-  repeated load cost is deliberately measured, not hidden — see
-  `load_document()` in the harness.
+- Every agent independently loads the original document and sends it to Gemini
+  as multimodal input.
+- Agents are independent: none relies on another agent's output, and there is
+  no shared extracted-text state.
+- **Agent 1 has a different job here**: it checks whether the document is
+  legible and returns a small two-field JSON verdict. Agents 2 and 3 ask their
+  own focused questions about the document. The prompts ask for the answers,
+  not extra explanations, so the responses stay small.
+- The document is loaded **three times**, once per agent. That repeated load
+  time is measured in the program; see `load_document()`.
 
-**Cost shape**: every agent pays for the large multimodal *input* (the
-document bytes), but every agent's *output* stays small, since each one is
-answering a targeted yes/no-or-JSON question rather than transcribing
-anything. Input cost scales with agent count; output cost does not.
+**Cost in simple terms**: every agent pays for the large multimodal input, but
+each agent's output stays small. Input cost grows with the number of agents;
+output cost changes much less.
 
-## What's held constant between A and B, and what's deliberately not
+## What's held constant between A and B, and what's deliberately different
 
-So the comparison isolates architecture, not incidental differences:
+To keep the comparison fair, the test keeps these things the same:
 
 - Same documents, same Gemini model, same number of agents, same run count.
-- **Agents 2..N use an identical `prompt`** in both approaches — the harness
-  supplies either the raw document or the extracted text alongside it, so
-  the instruction itself is equivalent; each one asks the same targeted
-  question regardless of which approach it's running under.
-- **Agent 1 is intentionally *not* given identical prompts.** Its job is
-  structurally different between the two architectures: in Approach A it
-  must produce reusable full text (so it needs a verbose, transcription-style
-  prompt); in Approach B nothing consumes its output, so forcing it to
-  transcribe the whole document would just inflate its output tokens for no
-  reason. Its Approach B prompt matches the "narrow independent question"
-  pattern every other agent already uses. This is configured via
-  `agents_config.json`'s `approach_a_prompt` field on Agent 1 (see README).
-- Agents are deliberately simple/dummy (extraction/validation,
-  classification, schema extraction) so what's being measured is the
-  architecture's latency/token cost, not the quality of any real business
-  logic.
-- Approaches are never interleaved: all of Approach A runs first (across
-  every document and run), then all of Approach B.
+- **Agents 2 and 3 use the same `prompt`** in both approaches. Only the
+  document they receive changes: extracted text in A, raw document in B.
+- **Agent 1 uses different instructions on purpose.** In A it produces the
+  reusable full text. In B, nothing uses its output, so it only checks
+  readability. This is set by the `approach_a_prompt` field for Agent 1 in
+  `agents_config.json`.
+- The agents do simple tasks so the test measures latency and token cost,
+  rather than the quality of a real business process.
+- The two approaches run separately: A first, then B.
 
 ## What gets measured, per Gemini call
 
@@ -144,11 +265,11 @@ end_time, latency_seconds, document_load_seconds, gemini_api_latency_seconds,
 total_agent_latency_seconds, input_token_count, output_token_count,
 total_token_count, model_name, success, error_message`
 
-— written to `output/gemini_calls_<timestamp>.csv`, one row per call. A
-second CSV, `output/document_summary_<timestamp>.csv`, aggregates this to
-one row per (document, approach, run): total latency, total tokens, call
-count, failure count. A final console report compares Approach A vs B on
-mean/P50/P95 latency and mean/total tokens, plus percentage differences.
+— written to `output/gemini_calls_<timestamp>.csv`, one row per call. A second
+file, `output/document_summary_<timestamp>.csv`, rolls this up to one row per
+document, approach, and run: total latency, total tokens, call count, and
+failures. The final console report compares mean, P50, and P95 latency, along
+with token totals and percentage differences.
 
 ## Repo layout
 
@@ -322,9 +443,9 @@ On the small sample run, Approach A (extract once) was cheaper overall and
 had lower P50/mean latency, but the reason is more specific than "B repeats
 more work": B's *input* cost scales with agent count (every agent re-pays for
 the full document), while B's *output* cost is much lower than A's, since only
-A's Agent 1 has to transcribe anything. With 700-token documents, the higher
-output-token cost reverses the cost result: the projection above makes B
-cheaper, while A remains faster in the measured sequential pattern. Approach
+A's Agent 1 has to transcribe anything. With the spreadsheet's 700-token,
+1,290-raw-PDF-token planning case, the projection above makes B cheaper, while
+A remains faster in the measured sequential pattern. Approach
 B's structural advantage is that agents are fully independent — no
 extraction-quality bottleneck where one bad Agent-1 call breaks everyone
 downstream. The right choice depends on document size, output-token pricing,
