@@ -1,0 +1,5 @@
+document_name,approach,run_index,total_end_to_end_latency_seconds,total_input_tokens,total_output_tokens,total_tokens,num_gemini_calls,num_failed_calls
+dc1.png,A,0,3.24880920799842,1353,189,1542,2,0
+dc2.png,A,0,3.1360533329971076,1371,198,1569,2,0
+dc1.png,B,0,3.746184457999334,2258,196,2454,2,0
+dc2.png,B,0,3.1661374180002895,2282,224,2506,2,0

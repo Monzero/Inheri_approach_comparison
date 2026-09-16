@@ -1,0 +1,18 @@
+[
+  {
+    "agent_number": 1,
+    "name": "document_extraction",
+    "prompt": "Check whether this document is legible and appears to be a genuine, readable document (not blank, corrupted, or unreadable). Respond with a single JSON object with exactly these keys and no others: {\"is_legible\": true or false, \"apparent_document_type\": string}. Do not transcribe, summarize, or explain.",
+    "approach_a_prompt": "Carefully read this document and extract all readable text content verbatim. Preserve structure where possible (headings, lists, table rows as plain text lines). Do not summarize, interpret, or omit content. Output only the extracted text, with no additional commentary."
+  },
+  {
+    "agent_number": 2,
+    "name": "document_classification",
+    "prompt": "Classify this document into exactly one of the following categories: invoice, contract, letter, report, form, receipt, other. Respond with only the category name, nothing else."
+  },
+  {
+    "agent_number": 3,
+    "name": "schema_extraction",
+    "prompt": "Extract the following fields from this document if present: document_title, date, sender, recipient, total_amount, key_entities. Respond as a single JSON object with exactly those keys, using null for any field that is not present."
+  }
+]
